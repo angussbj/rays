@@ -1,4 +1,4 @@
-const CANVAS_SIZE = 512;
+const CANVAS_SIZE = 1024;
 
 export const xyOffset = 0;
 export const squareStride = 4 * 2;
@@ -41,7 +41,6 @@ const textureStorage = device.createBuffer({
   size: textureArray.byteLength,
   usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
 });
-textureArray.fill(0.4);
 device.queue.writeBuffer(textureStorage, 0, textureArray);
 
 const frameValue = new Uint32Array([0]);
@@ -69,15 +68,21 @@ function toU32(x, y, z) {
   return (toU8(x) << 16) + (toU8(y) << 8) + toU8(z);
 }
 
-const topPlane = [PLANE_FIXED_Y + toU32(0, 5, 0), EMISSIVE + toU32(255, 255, 255)];
-const bottomPlane = [PLANE_FIXED_Y + toU32(0, -5, 0), EMISSIVE + toU32(200, 200, 200)];
-const leftPlane = [PLANE_FIXED_X + toU32(5, 0, 0), EMISSIVE + toU32(255, 150, 255)];
-const rightPlane = [PLANE_FIXED_X + toU32(-5, 0, 0), EMISSIVE + toU32(150, 255, 255)];
-const backPlane = [PLANE_FIXED_Z + toU32(0, 0, 10), REFLECTIVE + toU32(170, 170, 170)];
-const backbackPlane = [PLANE_FIXED_Z + toU32(0, 0, -2), EMISSIVE + toU32(255, 255, 150)];
-const sphere = [SPHERE + toU32(3, 2, 6), REFLECTIVE + toU32(150, 150, 180)];
-const sphere2 = [SPHERE + toU32(-3, 4, 8), EMISSIVE + toU32(255, 255, 0)];
-const sphere3 = [SPHERE + toU32(0, 4, 8), EMISSIVE + toU32(255, 0, 255)];
+const topPlane = [PLANE_FIXED_Y + toU32(0, 5, 0), DIFFUSE + toU32(255, 255, 255)];
+const bottomPlane = [PLANE_FIXED_Y + toU32(0, -5, 0), DIFFUSE + toU32(180, 255, 255)];
+const leftPlane = [PLANE_FIXED_X + toU32(5, 0, 0), DIFFUSE + toU32(255, 180, 255)];
+const rightPlane = [PLANE_FIXED_X + toU32(-5, 0, 0), DIFFUSE + toU32(255, 255, 180)];
+const backbackPlane = [
+  PLANE_FIXED_Z + toU32(0, 0, -1),
+  REFLECTIVE + toU32(180, 255, 180),
+];
+const backPlane = [PLANE_FIXED_Z + toU32(0, 0, 10), REFLECTIVE + toU32(180, 180, 180)];
+const sphereA = [SPHERE + toU32(-3, -3, 7), REFLECTIVE + toU32(170, 170, 180)];
+const sphereB = [SPHERE + toU32(3, -3, 7), REFLECTIVE + toU32(170, 170, 180)];
+const sphereC = [SPHERE + toU32(0, -3, 1), REFLECTIVE + toU32(170, 170, 180)];
+const sphereD = [SPHERE + toU32(0, -3, 7), REFLECTIVE + toU32(170, 170, 180)];
+const sphere2 = [SPHERE + toU32(-3, 4, 8), EMISSIVE + toU32(255, 0, 255)];
+const sphere3 = [SPHERE + toU32(0, 4, 8), EMISSIVE + toU32(255, 255, 0)];
 const sphere4 = [SPHERE + toU32(3, 4, 8), EMISSIVE + toU32(0, 255, 255)];
 
 const objectsArray = new Uint32Array([
@@ -87,7 +92,10 @@ const objectsArray = new Uint32Array([
   ...rightPlane,
   ...backPlane,
   ...backbackPlane,
-  // ...sphere,
+  ...sphereA,
+  ...sphereB,
+  ...sphereC,
+  ...sphereD,
   ...sphere2,
   ...sphere3,
   ...sphere4,
@@ -131,9 +139,9 @@ const displayShaderModule = device.createShaderModule({
   `,
 });
 
-const WORKGROUP_SIZE = 8;
+const WORKGROUP_SIZE = 12;
 const TOLERANCE = 0.01;
-const STEPS = 10000;
+const STEPS = 1000;
 const rayMarchingShaderModule = device.createShaderModule({
   label: "Ray marching shader",
   code: /* wgsl */ `
@@ -195,7 +203,12 @@ const rayMarchingShaderModule = device.createShaderModule({
           return normalize(vec3f(0, position.y - getY(objects[i]), 0));
         }
         case ${PLANE_FIXED_Z}: {
-          return normalize(vec3f(0, 0, position.z - getZ(objects[i])));
+          var normal = vec3f(0, 0, position.z - getZ(objects[i]));
+          if (length(normal) == 0) {
+            normal = vec3f(0, 0, -direction.z);
+          }
+          return normalize(normal);
+          // return normalize(vec3f(0, 0, -direction.z));
         }
         case ${SPHERE}: {
           return normalize(position - getPos(objects[i])); // Only works from outside the sphere
@@ -211,14 +224,17 @@ const rayMarchingShaderModule = device.createShaderModule({
       return direction - 2 * dot(direction, normal) * normal;
     }
 
-    fn findClosestObject(pos: vec3f) -> ObjectWithDistance {
+    fn findClosestObject(pos: vec3f, dir: vec3f) -> ObjectWithDistance {
       var closestObject: ObjectWithDistance; 
       closestObject.distance = f32(${SPACE_BOUND});
       for (var i = u32(0); i < arrayLength(&objects); i += 2) {
         let di = distanceToObject(pos, i);
         if (di < closestObject.distance) {
-          closestObject.distance = di;
-          closestObject.index = i;
+          let normal = getNormal(dir, pos, i);
+          if (dot(normal, dir) < 0) {
+            closestObject.distance = di;
+            closestObject.index = i;
+          }
         }
       }
       return closestObject;
@@ -238,7 +254,7 @@ const rayMarchingShaderModule = device.createShaderModule({
     }
 
     fn rand(seed: u32) -> f32 {
-      return f32(randInner(randInner(seed))) / 10909;
+      return f32(randInner(randInner(randInner(seed)))) / 10909;
     }
 
     fn getRandomDirection(position: vec3f, direction: vec3f, seed: u32, i: u32) -> vec3f {
@@ -250,44 +266,43 @@ const rayMarchingShaderModule = device.createShaderModule({
     }
 
     fn castRay(pos: vec3f, dir: vec3f, seed: u32) -> vec4f {
-      var result = vec4f(0, 0, 0, 0);
       var direction = dir;
       var position = pos;
       var color = vec4f(1, 1, 1, 1);
-      var emitted = false;
       var closestObject: ObjectWithDistance;
-      for (var i = u32(0); i < ${STEPS} && !emitted; i++) {
-        closestObject = findClosestObject(position);
+      for (var i = u32(0); i < ${STEPS}; i++) {
+        closestObject = findClosestObject(position, direction);
         if (closestObject.distance < ${TOLERANCE}) {
           switch objects[closestObject.index + 1] & (255 << 24) {
             case ${EMISSIVE}: {
-              // return vec4f(0, 0, 0, 1);
               return color * getColor(objects[closestObject.index + 1]);
-              emitted = true;
             }
             case ${REFLECTIVE}: {
               direction = reflect(direction, position, closestObject.index);
               color = color * getColor(objects[closestObject.index + 1]);
-              position = position + direction * max(closestObject.distance, ${TOLERANCE});
+              position = position + direction * max(closestObject.distance, ${
+                2 * TOLERANCE // TODO: find a safer way to make sure we get far enough away from a reflective surface
+              });
             }
             case ${DIFFUSE}: {
               direction = getRandomDirection(position, direction, seed + bitcast<u32>(length(position * direction.yzx)), closestObject.index);
+              // return vec4f(direction, 1);
               color = color * getColor(objects[closestObject.index + 1]);
-              position = position + direction * max(closestObject.distance, ${TOLERANCE});
+              position = position + direction * max(closestObject.distance, ${
+                TOLERANCE // TODO: find a safer way to make sure we get far enough away from a reflective surface
+              });
             }
             default: {
-              return vec4f(1, 0, 0, 1);
-              emitted = true;
+              return vec4f(0, 0, 0, 1);
             }
           }
         // } else if (length(color) < 1.01) {
         //   return vec4f(0, 1, 0, 1);
-        //   emitted = true;
         } else {
           position = position + direction * max(closestObject.distance, ${TOLERANCE});
         }
       }
-      return vec4f(1, 0, 0, 1);
+      return vec4f(0, 0, 0, 1);
       // TODO: identify why we reach this situation so often
       // return vec4f(-position / 1, 1);
 
@@ -300,17 +315,19 @@ const rayMarchingShaderModule = device.createShaderModule({
     @compute
     @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE})
     fn computeMain(@builtin(global_invocation_id) pixel: vec3u) {
-      let direction = normalize(vec3f(pxTo01(pixel.x), pxTo01(pixel.y), 1));
-      let position = vec3f(0, 0, 0);
+      let direction = normalize(vec3f(1 * pxTo01(pixel.x) - 0.3, 1 * pxTo01(pixel.y) - 0.3, 1));
+      let position = vec3f(2, 2, 0);
       let index = 3 * (pixel.x + pixel.y * ${CANVAS_SIZE});
       let newColor = castRay(position, direction, index + frame);
-      // let n = f32(frame);
-      pixels[index] = newColor.x;
-      pixels[index + 1] = newColor.y;
-      pixels[index + 2] = newColor.z;
-      // pixels[index] = pixels[index] * (n - 1) / n + newColor.x / n;
-      // pixels[index + 1] = pixels[index + 1] * (n - 1) / n + newColor.y / n;
-      // pixels[index + 2] = pixels[index + 2] * (n - 1) / n + newColor.z / n;
+      // pixels[index] = newColor.x;
+      // pixels[index + 1] = newColor.y;
+      // pixels[index + 2] = newColor.z;
+      let n = f32(frame);
+      if (length(newColor) > 1) {
+        pixels[index] = pixels[index] * (n - 1) / n + newColor.x / n;
+        pixels[index + 1] = pixels[index + 1] * (n - 1) / n + newColor.y / n;
+        pixels[index + 2] = pixels[index + 2] * (n - 1) / n + newColor.z / n;
+      }
     }
   `,
 });
@@ -420,8 +437,6 @@ function update() {
   pass.draw(square.length / 2);
   pass.end();
   device.queue.submit([encoder.finish()]);
-
-  // window.requestAnimationFrame(update);
 }
 
-update();
+setInterval(update, 1000);
