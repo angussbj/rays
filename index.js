@@ -1,3 +1,5 @@
+const CANVAS_SIZE = 512;
+
 export const xyOffset = 0;
 export const squareStride = 4 * 2;
 
@@ -33,6 +35,23 @@ const vertexBufferLayout = {
   ],
 };
 
+const textureArray = new Float32Array(CANVAS_SIZE * CANVAS_SIZE * 3);
+const textureStorage = device.createBuffer({
+  label: "Texture storage",
+  size: textureArray.byteLength,
+  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+});
+textureArray.fill(0.4);
+device.queue.writeBuffer(textureStorage, 0, textureArray);
+
+const frameValue = new Uint32Array([0]);
+const frameUniform = device.createBuffer({
+  label: "Frame uniform",
+  size: 4,
+  usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+});
+device.queue.writeBuffer(frameUniform, 0, frameValue);
+
 const PLANE_FIXED_X = 1 << 24;
 const PLANE_FIXED_Y = 2 << 24;
 const PLANE_FIXED_Z = 3 << 24;
@@ -51,14 +70,15 @@ function toU32(x, y, z) {
 }
 
 const topPlane = [PLANE_FIXED_Y + toU32(0, 5, 0), EMISSIVE + toU32(255, 255, 255)];
-const bottomPlane = [PLANE_FIXED_Y + toU32(0, -5, 0), DIFFUSE + toU32(200, 200, 200)];
-const leftPlane = [PLANE_FIXED_X + toU32(5, 0, 0), DIFFUSE + toU32(255, 150, 255)];
-const rightPlane = [PLANE_FIXED_X + toU32(-5, 0, 0), DIFFUSE + toU32(150, 255, 255)];
+const bottomPlane = [PLANE_FIXED_Y + toU32(0, -5, 0), EMISSIVE + toU32(200, 200, 200)];
+const leftPlane = [PLANE_FIXED_X + toU32(5, 0, 0), EMISSIVE + toU32(255, 150, 255)];
+const rightPlane = [PLANE_FIXED_X + toU32(-5, 0, 0), EMISSIVE + toU32(150, 255, 255)];
 const backPlane = [PLANE_FIXED_Z + toU32(0, 0, 10), REFLECTIVE + toU32(170, 170, 170)];
-const backbackPlane = [PLANE_FIXED_Z + toU32(0, 0, -2), DIFFUSE + toU32(255, 255, 150)];
+const backbackPlane = [PLANE_FIXED_Z + toU32(0, 0, -2), EMISSIVE + toU32(255, 255, 150)];
 const sphere = [SPHERE + toU32(3, 2, 6), REFLECTIVE + toU32(150, 150, 180)];
-const sphere2 = [SPHERE + toU32(-3, -4, 8), EMISSIVE + toU32(255, 0, 0)];
-const sphere3 = [SPHERE + toU32(-3, -3, 8), EMISSIVE + toU32(0, 0, 240)];
+const sphere2 = [SPHERE + toU32(-3, 4, 8), EMISSIVE + toU32(255, 255, 0)];
+const sphere3 = [SPHERE + toU32(0, 4, 8), EMISSIVE + toU32(255, 0, 255)];
+const sphere4 = [SPHERE + toU32(3, 4, 8), EMISSIVE + toU32(0, 255, 255)];
 
 const objectsArray = new Uint32Array([
   ...topPlane,
@@ -70,6 +90,7 @@ const objectsArray = new Uint32Array([
   ...sphere,
   ...sphere2,
   ...sphere3,
+  ...sphere4,
 ]); // (object_type, x, y, z; surface_type, r, g, b)
 const objectsBuffer = device.createBuffer({
   label: "Scene objects",
@@ -80,8 +101,8 @@ device.queue.writeBuffer(objectsBuffer, 0, objectsArray);
 
 const SPACE_BOUND = 1000000; // larger than the space objects are in
 
-const shaderModule = device.createShaderModule({
-  label: "Shader",
+const displayShaderModule = device.createShaderModule({
+  label: "Display shaders (vertex and fragment)",
   code: /* wgsl */ `
     struct VertexInput {
       @location(0) pos: vec2f,
@@ -89,23 +110,39 @@ const shaderModule = device.createShaderModule({
 
     struct VertexOutput {
       @builtin(position) pos: vec4f,
-      @location(1) uv: vec2f,
     }
 
-    struct ObjectWithDistance {
-      @location(0) index: u32,
-      @location(1) distance: f32,
-    }
-
-    @group(0) @binding(0) var<storage> objects: array<u32>;
+    @group(0) @binding(0) var<storage, read_write> pixels: array<f32>;
 
     @vertex
     fn vertexMain(input: VertexInput) -> VertexOutput {
       var output: VertexOutput;
       output.pos = vec4f(input.pos, 0, 1);
-      output.uv = input.pos;
       return output;
     }
+
+    @fragment
+    fn fragmentMain(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+      let index = 3 * (u32(pos.y) + u32(pos.x) * ${CANVAS_SIZE});
+      // return vec4f(f32(index) / (512 * 512 * 3));
+      // return vec4f((pos.x) / ${CANVAS_SIZE}, pos.y / ${CANVAS_SIZE}, 0, 1);
+      return vec4f(pixels[index], pixels[index + 1], pixels[index + 2], 1);
+    }
+  `,
+});
+
+const WORKGROUP_SIZE = 8;
+const rayMarchingShaderModule = device.createShaderModule({
+  label: "Ray marching shader",
+  code: /* wgsl */ `
+    struct ObjectWithDistance {
+      @location(0) index: u32,
+      @location(1) distance: f32,
+    }
+
+    @group(0) @binding(0) var<storage, read_write> pixels: array<f32>;
+    @group(0) @binding(1) var<storage> objects: array<u32>;
+    @group(0) @binding(2) var<uniform> frame: u32;
 
     fn getI8AsF32(v: u32, offset: u32) -> f32 {
       return f32((((v & (u32(255) << offset)) >> offset) + 128) % 256) - 128;
@@ -210,14 +247,14 @@ const shaderModule = device.createShaderModule({
       return sign(dot(randomVector, normal)) * randomVector;
     }
 
-    fn castRay(pos: vec3f, dir: vec3f) -> vec4f {
+    fn castRay(pos: vec3f, dir: vec3f, seed: u32) -> vec4f {
       var result = vec4f(0, 0, 0, 0);
       var direction = dir;
       var position = pos;
       var color = vec4f(1, 1, 1, 1);
       var emitted = false;
       var closestObject: ObjectWithDistance;
-      for (var rayCount = u32(0); rayCount < 50; rayCount++) {
+      for (var rayCount = u32(0); rayCount < 1; rayCount++) {
         direction = dir;
         position = pos;
         color = vec4f(1, 1, 1, 1);
@@ -236,7 +273,7 @@ const shaderModule = device.createShaderModule({
                 position = position + direction * max(closestObject.distance, 0.01);
               }
               case ${DIFFUSE}: {
-                direction = getRandomDirection(position, direction, rayCount + bitcast<u32>(length(position * direction.yzx)), closestObject.index);
+                direction = getRandomDirection(position, direction, seed + rayCount + bitcast<u32>(length(position * direction.yzx)), closestObject.index);
                 color = color * getColor(objects[closestObject.index + 1]);
                 position = position + direction * max(closestObject.distance, 0.01);
               }
@@ -246,24 +283,38 @@ const shaderModule = device.createShaderModule({
               }
             }
           } else if (length(color) < 1.01) {
-            result = result + vec4f(0, 0, 0, 1);
+            result = result + vec4f(0, 1, 0, 1);
             emitted = true;
           } else {
             position = position + direction * max(closestObject.distance, 0.01);
           }
         }
+        return vec4f(1, 0, 0, 1);
         // TODO: identify why we reach this situation so often
-        // return vec4f(-position / 50, 1);
+        // return vec4f(-position / 1, 1);
         // result = result + vec4f(1, 0, 0, 1);
       }
-      return result / 50;
+      return result;
+    }
+    
+    fn pxTo01(px: u32) -> f32 {
+      return f32(2 * px - ${CANVAS_SIZE}) / ${CANVAS_SIZE};
     }
 
-    @fragment
-    fn fragmentMain(@location(1) pos: vec2f) -> @location(0) vec4f {
-      var direction = normalize(vec3f(pos, 1));
-      var position = vec3f(0, 0, 0);
-      return castRay(position, direction);
+    @compute
+    @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE})
+    fn computeMain(@builtin(global_invocation_id) pixel: vec3u) {
+      let direction = normalize(vec3f(pxTo01(pixel.x), pxTo01(pixel.y), 1));
+      let position = vec3f(0, 0, 0);
+      let index = 3 * (pixel.x + pixel.y * ${CANVAS_SIZE});
+      let newColor = castRay(direction, position, index + frame);
+      let n = f32(frame);
+      pixels[index] = newColor.x;
+      pixels[index + 1] = newColor.y;
+      pixels[index + 2] = newColor.z;
+      // pixels[index] = pixels[index] * (n - 1) / n + newColor.x / n;
+      // pixels[index + 1] = pixels[index + 1] * (n - 1) / n + newColor.y / n;
+      // pixels[index + 2] = pixels[index + 2] * (n - 1) / n + newColor.z / n;
     }
   `,
 });
@@ -272,29 +323,60 @@ const bindGroupLayout = device.createBindGroupLayout({
   label: "Bind group layout",
   entries: [
     {
-      // Scene objects
+      // Texture as floats
       binding: 0,
-      visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+      visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
+      buffer: { type: "storage" },
+    },
+    {
+      // Scene objects
+      binding: 1,
+      visibility: GPUShaderStage.COMPUTE,
       buffer: { type: "read-only-storage" },
+    },
+    {
+      // Frame
+      binding: 2,
+      visibility: GPUShaderStage.COMPUTE,
+      buffer: {},
+    },
+  ],
+});
+
+const bindGroup = device.createBindGroup({
+  label: "Bind group",
+  layout: bindGroupLayout,
+  entries: [
+    {
+      binding: 0,
+      resource: { buffer: textureStorage },
+    },
+    {
+      binding: 1,
+      resource: { buffer: objectsBuffer },
+    },
+    {
+      binding: 2,
+      resource: { buffer: frameUniform },
     },
   ],
 });
 
 const pipelineLayout = device.createPipelineLayout({
-  label: "Pipeline Layout",
+  label: "Display pipeline Layout",
   bindGroupLayouts: [bindGroupLayout],
 });
 
-const pipeline = device.createRenderPipeline({
-  label: "Pipeline",
+const displayPipeline = device.createRenderPipeline({
+  label: "Display pipeline",
   layout: pipelineLayout,
   vertex: {
-    module: shaderModule,
+    module: displayShaderModule,
     entryPoint: "vertexMain",
     buffers: [vertexBufferLayout],
   },
   fragment: {
-    module: shaderModule,
+    module: displayShaderModule,
     entryPoint: "fragmentMain",
     targets: [
       {
@@ -304,19 +386,27 @@ const pipeline = device.createRenderPipeline({
   },
 });
 
-const bindGroup = device.createBindGroup({
-  label: "Bind group",
-  layout: bindGroupLayout,
-  entries: [
-    {
-      binding: 0,
-      resource: { buffer: objectsBuffer },
-    },
-  ],
+const rayMarchingPipeline = device.createComputePipeline({
+  label: "Ray marching pipeline",
+  layout: pipelineLayout,
+  compute: {
+    module: rayMarchingShaderModule,
+    entryPoint: "computeMain",
+  },
 });
 
 function update() {
+  frameValue[0] += 1;
+  device.queue.writeBuffer(frameUniform, 0, frameValue);
+
   const encoder = device.createCommandEncoder();
+
+  const computePass = encoder.beginComputePass();
+  computePass.setPipeline(rayMarchingPipeline);
+  computePass.setBindGroup(0, bindGroup);
+  const workgroupCount = Math.ceil(CANVAS_SIZE / WORKGROUP_SIZE);
+  computePass.dispatchWorkgroups(workgroupCount, workgroupCount);
+  computePass.end();
 
   const pass = encoder.beginRenderPass({
     colorAttachments: [
@@ -328,7 +418,7 @@ function update() {
     ],
   });
 
-  pass.setPipeline(pipeline);
+  pass.setPipeline(displayPipeline);
   pass.setVertexBuffer(0, vertexBuffer);
   pass.setBindGroup(0, bindGroup);
   pass.draw(square.length / 2);
