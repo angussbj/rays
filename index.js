@@ -87,7 +87,7 @@ const objectsArray = new Uint32Array([
   ...rightPlane,
   ...backPlane,
   ...backbackPlane,
-  ...sphere,
+  // ...sphere,
   ...sphere2,
   ...sphere3,
   ...sphere4,
@@ -123,7 +123,7 @@ const displayShaderModule = device.createShaderModule({
 
     @fragment
     fn fragmentMain(@builtin(position) pos: vec4f) -> @location(0) vec4f {
-      let index = 3 * (u32(pos.y) + u32(pos.x) * ${CANVAS_SIZE});
+      let index = 3 * (u32(pos.x) + (${CANVAS_SIZE} - u32(pos.y)) * ${CANVAS_SIZE});
       // return vec4f(f32(index) / (512 * 512 * 3));
       // return vec4f((pos.x) / ${CANVAS_SIZE}, pos.y / ${CANVAS_SIZE}, 0, 1);
       return vec4f(pixels[index], pixels[index + 1], pixels[index + 2], 1);
@@ -132,6 +132,8 @@ const displayShaderModule = device.createShaderModule({
 });
 
 const WORKGROUP_SIZE = 8;
+const TOLERANCE = 0.01;
+const STEPS = 10000;
 const rayMarchingShaderModule = device.createShaderModule({
   label: "Ray marching shader",
   code: /* wgsl */ `
@@ -254,51 +256,45 @@ const rayMarchingShaderModule = device.createShaderModule({
       var color = vec4f(1, 1, 1, 1);
       var emitted = false;
       var closestObject: ObjectWithDistance;
-      for (var rayCount = u32(0); rayCount < 1; rayCount++) {
-        direction = dir;
-        position = pos;
-        color = vec4f(1, 1, 1, 1);
-        emitted = false;
-        for (var i = u32(0); i < 1000 && !emitted; i++) {
-          closestObject = findClosestObject(position);
-          if (closestObject.distance < 0.01) {
-            switch objects[closestObject.index + 1] & (255 << 24) {
-              case ${EMISSIVE}: {
-                result = result + color * getColor(objects[closestObject.index + 1]);
-                emitted = true;
-              }
-              case ${REFLECTIVE}: {
-                direction = reflect(direction, position, closestObject.index);
-                color = color * getColor(objects[closestObject.index + 1]);
-                position = position + direction * max(closestObject.distance, 0.01);
-              }
-              case ${DIFFUSE}: {
-                direction = getRandomDirection(position, direction, seed + rayCount + bitcast<u32>(length(position * direction.yzx)), closestObject.index);
-                color = color * getColor(objects[closestObject.index + 1]);
-                position = position + direction * max(closestObject.distance, 0.01);
-              }
-              default: {
-                result = result + vec4f(1, 0, 0, 1);
-                emitted = true;
-              }
+      for (var i = u32(0); i < ${STEPS} && !emitted; i++) {
+        closestObject = findClosestObject(position);
+        if (closestObject.distance < ${TOLERANCE}) {
+          switch objects[closestObject.index + 1] & (255 << 24) {
+            case ${EMISSIVE}: {
+              // return vec4f(0, 0, 0, 1);
+              return color * getColor(objects[closestObject.index + 1]);
+              emitted = true;
             }
-          } else if (length(color) < 1.01) {
-            result = result + vec4f(0, 1, 0, 1);
-            emitted = true;
-          } else {
-            position = position + direction * max(closestObject.distance, 0.01);
+            case ${REFLECTIVE}: {
+              direction = reflect(direction, position, closestObject.index);
+              color = color * getColor(objects[closestObject.index + 1]);
+              position = position + direction * max(closestObject.distance, ${TOLERANCE});
+            }
+            case ${DIFFUSE}: {
+              direction = getRandomDirection(position, direction, seed + bitcast<u32>(length(position * direction.yzx)), closestObject.index);
+              color = color * getColor(objects[closestObject.index + 1]);
+              position = position + direction * max(closestObject.distance, ${TOLERANCE});
+            }
+            default: {
+              return vec4f(1, 0, 0, 1);
+              emitted = true;
+            }
           }
+        // } else if (length(color) < 1.01) {
+        //   return vec4f(0, 1, 0, 1);
+        //   emitted = true;
+        } else {
+          position = position + direction * max(closestObject.distance, ${TOLERANCE});
         }
-        return vec4f(1, 0, 0, 1);
-        // TODO: identify why we reach this situation so often
-        // return vec4f(-position / 1, 1);
-        // result = result + vec4f(1, 0, 0, 1);
       }
-      return result;
+      return vec4f(1, 0, 0, 1);
+      // TODO: identify why we reach this situation so often
+      // return vec4f(-position / 1, 1);
+
     }
     
     fn pxTo01(px: u32) -> f32 {
-      return f32(2 * px - ${CANVAS_SIZE}) / ${CANVAS_SIZE};
+      return f32(2 * i32(px) - ${CANVAS_SIZE}) / ${CANVAS_SIZE};
     }
 
     @compute
@@ -307,8 +303,8 @@ const rayMarchingShaderModule = device.createShaderModule({
       let direction = normalize(vec3f(pxTo01(pixel.x), pxTo01(pixel.y), 1));
       let position = vec3f(0, 0, 0);
       let index = 3 * (pixel.x + pixel.y * ${CANVAS_SIZE});
-      let newColor = castRay(direction, position, index + frame);
-      let n = f32(frame);
+      let newColor = castRay(position, direction, index + frame);
+      // let n = f32(frame);
       pixels[index] = newColor.x;
       pixels[index + 1] = newColor.y;
       pixels[index + 2] = newColor.z;
